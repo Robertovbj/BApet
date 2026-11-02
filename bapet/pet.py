@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt
-from PySide6.QtGui import QBitmap, QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QCursor, QFont, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .config import PetState
+from .input_shape import clear_input_region, dilate, set_input_region
 from .models import LoadedModel
 from .renderer import Frame
 
@@ -107,7 +108,7 @@ class Pet(QWidget):
         self._image = None
         self._buffer = None
         self._frame = None
-        self.clearMask()
+        clear_input_region(self)
         lm = self.controller.manager.acquire(file)
         if lm is not None:
             self.on_model_ready(lm)
@@ -385,23 +386,13 @@ class Pet(QWidget):
     def _update_mask(self) -> None:
         self._mask_age = 0.0
         if self._buffer is None or self._frame is None:
-            self.clearMask()
+            clear_input_region(self)
             return
-        lw, lh = self.width(), self.height()
-        alpha = self._buffer[:, :, 3]
-        h, w = alpha.shape
-        ys = np.minimum((np.arange(lh) * h / max(lh, 1)).astype(int), h - 1)
-        xs = np.minimum((np.arange(lw) * w / max(lw, 1)).astype(int), w - 1)
-        solid = alpha[np.ix_(ys, xs)] > 16
-        # Dilate by 2 px so edges stay clickable and anti-aliasing is not clipped.
-        grown = solid.copy()
-        for dy, dx in ((-2, 0), (2, 0), (0, -2), (0, 2), (-1, -1), (1, 1), (-1, 1), (1, -1)):
-            grown |= np.roll(np.roll(solid, dy, axis=0), dx, axis=1)
-        if not grown.any():
-            grown[lh // 2, lw // 2] = True
-        argb = np.where(grown, np.uint32(0xFF000000), np.uint32(0)).astype(np.uint32)
-        img = QImage(argb.data, lw, lh, lw * 4, QImage.Format.Format_ARGB32)
-        self.setMask(QBitmap.fromImage(img.createAlphaMask()))
+        radius = int(math.ceil(2 * self.devicePixelRatioF()))
+        solid = dilate(self._buffer[:, :, 3] > 16, radius)  # keep edges easy to click
+        if not solid.any():
+            solid[solid.shape[0] // 2, solid.shape[1] // 2] = True
+        set_input_region(self, solid)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         p = QPainter(self)
@@ -446,7 +437,7 @@ class Pet(QWidget):
         if not self._dragging and delta.manhattanLength() >= DRAG_THRESHOLD:
             self._dragging = True
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            self.clearMask()  # keep receiving events even over transparent pixels
+            clear_input_region(self)  # keep receiving events even over transparent pixels
             if self.lm is not None:
                 self.mode = "drag"
                 self.play(self.lm.pickup, loop=True)

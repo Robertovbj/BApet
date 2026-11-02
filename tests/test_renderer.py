@@ -36,3 +36,25 @@ def test_renderer_smoke():
     assert rgba[..., 3].max() == 255  # something was drawn
     gpu.release()
     r.release()
+
+
+def test_supersampled_output_keeps_size_and_premultiplied_alpha():
+    from bapet.renderer import Renderer, RendererError
+    from bapet import gltf
+    from tests.test_gltf import build_glb
+
+    try:
+        r = Renderer(samples=4, supersample=2)
+    except RendererError:
+        pytest.skip("no OpenGL 3.3 context")
+    m = gltf.load_bytes(build_glb())
+    gpu = r.upload(m, [])
+    world, weights = m.bake(0).sample(0.0)
+    f = Frame.fit(*m.animation_bounds(m.bake(0)), ppu=50, pitch=0.0, margin=2)
+    w, h, rgba = r.render(gpu, world, weights, f, yaw=0.0)
+    assert (w, h) == (f.width, f.height)
+    assert rgba.shape == (h, w, 4)
+    assert rgba[..., 3].max() == 255
+    assert (rgba[..., :3].max(axis=2) <= rgba[..., 3]).all()  # premultiplied survives filtering
+    gpu.release()
+    r.release()

@@ -1,7 +1,9 @@
 """Off-screen OpenGL renderer (moderngl) for glTF character models.
 
-Each frame is rendered into a multisampled framebuffer, resolved and read back
-as premultiplied RGBA so the Qt layer can composite it into a translucent window.
+Each frame is rendered into a multisampled framebuffer at twice the output size,
+resolved, filtered down and read back as premultiplied RGBA so the Qt layer can
+composite it into a translucent window. MSAA alone cannot smooth alpha-tested hair
+and clothing or thin geometry such as halos; the supersampling handles those.
 GPU skinning uses a float texture for joint matrices (no uniform-count limits),
 the look matches the wiki viewer: unlit textures plus an inverted-hull outline.
 """
@@ -23,6 +25,7 @@ from .gltf import Model
 log = logging.getLogger(__name__)
 
 MAX_MORPHS = 4
+MAX_SUPERSAMPLED_SIZE = 2048  # output px; beyond this, 2x rendering costs too much memory
 
 VERTEX_SHADER = """
 #version 330 core
@@ -65,7 +68,9 @@ void main() {
     m = u_root * m;
     vec4 clip = u_view_proj * (m * vec4(p, 1.0));
     if (u_outline_px > 0.0) {
-        vec2 n = (u_view_proj * vec4(mat3(m) * in_normal, 0.0)).xy;
+        // Work in pixels: clip space is stretched whenever the window is not square.
+        vec3 world_n = mat3(m) * in_normal;
+        vec2 n = (u_view_proj * vec4(world_n, 0.0)).xy * u_viewport;
         float len = length(n);
         if (len > 1e-6) {
             clip.xy += (n / len) * (u_outline_px * 2.0 / u_viewport) * clip.w;
@@ -104,6 +109,26 @@ void main() {
         return;
     }
     f_color = vec4(c.rgb * c.a, c.a);
+}
+"""
+
+DOWNSAMPLE_VERTEX_SHADER = """
+#version 330 core
+out vec2 v_uv;
+void main() {
+    v_uv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(v_uv * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+
+# Sampling between four texels with a linear filter is an exact 2x2 box filter.
+DOWNSAMPLE_FRAGMENT_SHADER = """
+#version 330 core
+in vec2 v_uv;
+uniform sampler2D u_src;
+out vec4 f_color;
+void main() {
+    f_color = texture(u_src, v_uv);
 }
 """
 
@@ -332,10 +357,17 @@ def _create_context() -> moderngl.Context:
 
 
 class Renderer:
-    def __init__(self, samples: int = 4) -> None:
+    def __init__(self, samples: int = 4, supersample: int = 2) -> None:
         self.ctx = _create_context()
         self.program = self.ctx.program(vertex_shader=VERTEX_SHADER, fragment_shader=FRAGMENT_SHADER)
         self.samples = max(0, min(samples, self.ctx.info.get("GL_MAX_SAMPLES", 0) or 0))
+        # Supersampling is too slow when the "GPU" is the CPU (the Mesa fallback).
+        gl_renderer = str(self.ctx.info.get("GL_RENDERER", "")).lower()
+        software = any(name in gl_renderer for name in ("llvmpipe", "softpipe", "swrast", "software"))
+        self.supersample = 1 if software else (2 if supersample >= 2 else 1)
+        self._down_program = self.ctx.program(vertex_shader=DOWNSAMPLE_VERTEX_SHADER,
+                                              fragment_shader=DOWNSAMPLE_FRAGMENT_SHADER)
+        self._down_vao = self.ctx.vertex_array(self._down_program, [])
         self._fbos: dict[tuple[int, int], tuple] = {}
         self._uniforms = {name: self.program[name] for name in self.program if isinstance(self.program[name], moderngl.Uniform)}
         self._set("u_joint_tex", 1)
@@ -355,29 +387,42 @@ class Renderer:
     def upload(self, model: Model, textures: list) -> GpuModel:
         return GpuModel(self.ctx, self.program, model, textures)
 
+    def _supersample_for(self, w: int, h: int) -> int:
+        return self.supersample if max(w, h) <= MAX_SUPERSAMPLED_SIZE else 1
+
     def _targets(self, w: int, h: int):
+        """Return (draw, resolve, resolve_texture, output) framebuffers for an output size."""
         key = (w, h)
         fb = self._fbos.get(key)
         if fb is None:
-            if len(self._fbos) > 24:
+            if len(self._fbos) > 12:
                 for old in self._fbos.values():
-                    for obj in old:
+                    for obj in old[4]:
                         obj.release()
                 self._fbos.clear()
-            if self.samples:
-                color = self.ctx.renderbuffer((w, h), 4, samples=self.samples)
-                depth = self.ctx.depth_renderbuffer((w, h), samples=self.samples)
-                ms = self.ctx.framebuffer([color], depth)
-                rcolor = self.ctx.renderbuffer((w, h), 4)
-                resolve = self.ctx.framebuffer([rcolor])
-                fb = (ms, resolve, color, depth, rcolor)
+            ss = self._supersample_for(w, h)
+            color = self.ctx.renderbuffer((w * ss, h * ss), 4, samples=self.samples)
+            depth = self.ctx.depth_renderbuffer((w * ss, h * ss), samples=self.samples)
+            draw = self.ctx.framebuffer([color], depth)
+            owned = [draw, color, depth]
+            texture = None
+            if ss > 1:
+                texture = self.ctx.texture((w * ss, h * ss), 4)
+                texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+                texture.repeat_x = texture.repeat_y = False
+                resolve = self.ctx.framebuffer([texture])
+                out_color = self.ctx.renderbuffer((w, h), 4)
+                output = self.ctx.framebuffer([out_color])
+                owned += [texture, resolve, out_color, output]
+            elif self.samples:
+                out_color = self.ctx.renderbuffer((w, h), 4)
+                resolve = output = self.ctx.framebuffer([out_color])
+                owned += [out_color, resolve]
             else:
-                color = self.ctx.renderbuffer((w, h), 4)
-                depth = self.ctx.depth_renderbuffer((w, h))
-                ms = self.ctx.framebuffer([color], depth)
-                fb = (ms, ms, color, depth)
+                resolve = output = draw
+            fb = (draw, resolve, texture, output, owned)
             self._fbos[key] = fb
-        return fb[0], fb[1]
+        return fb[:4]
 
     def render(
         self,
@@ -396,11 +441,14 @@ class Renderer:
         """
         ctx = self.ctx
         model = gpu.model
-        w = max(1, int(round(frame.width * scale)))
-        h = max(1, int(round(frame.height * scale)))
-        target, resolve = self._targets(w, h)
+        # Round half up like Qt does for the native window size. A one-pixel difference
+        # would make Qt resample the whole frame, blurring it at fractional scale factors.
+        w = max(1, int(frame.width * scale + 0.5))
+        h = max(1, int(frame.height * scale + 0.5))
+        ss = self._supersample_for(w, h)
+        target, resolve, resolve_tex, output = self._targets(w, h)
         target.use()
-        ctx.viewport = (0, 0, w, h)
+        ctx.viewport = (0, 0, w * ss, h * ss)
         ctx.clear(0.0, 0.0, 0.0, 0.0, depth=1.0)
         ctx.enable(moderngl.DEPTH_TEST)
         ctx.blend_func = moderngl.ONE, moderngl.ONE_MINUS_SRC_ALPHA
@@ -411,7 +459,7 @@ class Renderer:
 
         self._write("u_view_proj", gl_mat(frame.view_proj()))
         self._write("u_root", gl_mat(rot_y(yaw)))
-        self._set("u_viewport", (float(w), float(h)))
+        self._set("u_viewport", (float(w * ss), float(h * ss)))
         self._set("u_outline_color", tuple(outline_color))
 
         def bind(it: _DrawItem, outline: bool) -> None:
@@ -440,7 +488,7 @@ class Renderer:
                     mv[k] = float(mw[k])
             self._set("u_morph", tuple(mv))
             self._set("u_outline_pass", outline)
-            self._set("u_outline_px", outline_px * scale if outline else 0.0)
+            self._set("u_outline_px", outline_px * scale * ss if outline else 0.0)
 
         if not gpu.joint_textures:
             self._white.use(1)
@@ -480,16 +528,24 @@ class Renderer:
 
         if resolve is not target:
             ctx.copy_framebuffer(resolve, target)
-        data = resolve.read(components=4, alignment=1)
+        if resolve_tex is not None:
+            output.use()
+            ctx.viewport = (0, 0, w, h)
+            ctx.disable(moderngl.DEPTH_TEST)
+            resolve_tex.use(0)
+            self._down_vao.render(moderngl.TRIANGLES, vertices=3)
+        data = output.read(components=4, alignment=1)
         rgba = np.frombuffer(data, np.uint8).reshape(h, w, 4)[::-1]
         return w, h, np.ascontiguousarray(rgba)
 
     def release(self) -> None:
         for fb in self._fbos.values():
-            for obj in fb:
+            for obj in fb[4]:
                 obj.release()
         self._fbos.clear()
         self._white.release()
+        self._down_vao.release()
+        self._down_program.release()
         self.program.release()
         self.ctx.release()
 

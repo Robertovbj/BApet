@@ -258,6 +258,7 @@ class Model:
         self.order: list[int] = []  # parents before children
         self._baked: dict[int, BakedAnimation] = {}
         self._rest: BakedAnimation | None = None
+        self._height: float | None = None
 
     # ---- animation helpers -------------------------------------------------
     @property
@@ -370,6 +371,7 @@ class Model:
     ) -> np.ndarray:
         """Approximate skinned vertex positions (subsampled) for bounds estimation."""
         pts = []
+        skin_matrices: dict[int, np.ndarray] = {}
         for ni in self.draw_nodes():
             node = self.nodes[ni]
             mesh = self.meshes[node.mesh]
@@ -385,7 +387,9 @@ class Model:
                         pos += delta[::step] * w_morph[k]
                 hom = np.concatenate([pos, np.ones((len(pos), 1), np.float32)], axis=1)
                 if node.skin is not None and prim.joints is not None:
-                    jm = self.joint_matrices(node.skin, world)
+                    if node.skin not in skin_matrices:
+                        skin_matrices[node.skin] = self.joint_matrices(node.skin, world)
+                    jm = skin_matrices[node.skin]
                     joints = prim.joints[::step].astype(np.int64)
                     wts = prim.weights[::step]
                     joints = np.clip(joints, 0, len(jm) - 1)
@@ -401,21 +405,45 @@ class Model:
             return np.zeros((1, 3), np.float32)
         return np.concatenate(pts, axis=0)
 
-    def animation_bounds(self, baked: BakedAnimation, samples: int = 12) -> tuple[float, float, float]:
-        """Return (radius around Y axis, y_min, y_max) over sampled frames."""
+    def _body_height(self) -> float:
+        """Height of the character in its rest pose, used to tell props from the body."""
+        if self._height is None:
+            rest = self.rest_pose()
+            pts = self.pose_points(rest.world[0], {n: w[0] for n, w in rest.weights.items()}, max_points=300)
+            self._height = max(float(pts[:, 1].max() - pts[:, 1].min()), 0.5)
+        return self._height
+
+    def animation_bounds(
+        self, baked: BakedAnimation, coarse_frames: int = 150, exact_frames: int = 4
+    ) -> tuple[float, float, float]:
+        """Return (radius around Y axis, y_min, y_max) that contain the whole animation.
+
+        Hair swings between any fixed set of sample frames and its tips are easily skipped
+        by vertex subsampling, so a quick pass over the animation finds the most extreme
+        frames and only those are checked against every vertex. Some cut-in animations move
+        props tens of units away, far outside any usable window, so limits are capped
+        relative to the character's height.
+        """
+
+        def extents(frame: int, max_points: int) -> tuple[float, float, float]:
+            pts = self.pose_points(baked.world[frame], {n: w[frame] for n, w in baked.weights.items()}, max_points)
+            return float(np.hypot(pts[:, 0], pts[:, 2]).max()), float(pts[:, 1].min()), float(pts[:, 1].max())
+
         frames = baked.frame_count
-        idxs = sorted(set(np.linspace(0, frames - 1, min(samples, frames)).astype(int).tolist()))
-        radius, y_min, y_max = 0.0, math.inf, -math.inf
-        for f in idxs:
-            pts = self.pose_points(baked.world[f], {n: w[f] for n, w in baked.weights.items()})
-            # Robust bounds: drop extreme outliers (stray collapsed verts at origin are harmless).
-            r = np.sqrt(pts[:, 0] ** 2 + pts[:, 2] ** 2)
-            radius = max(radius, float(np.percentile(r, 99.9)))
-            y_min = min(y_min, float(np.percentile(pts[:, 1], 0.05)))
-            y_max = max(y_max, float(np.percentile(pts[:, 1], 99.95)))
-        if not math.isfinite(y_min):
-            y_min, y_max = 0.0, 1.0
-        return radius, y_min, y_max
+        idxs = np.arange(0, frames, max(1, frames // coarse_frames))
+        coarse = np.array([extents(int(f), 200) for f in idxs])
+        extreme: set[int] = set()
+        for values in (coarse[:, 0], -coarse[:, 1], coarse[:, 2]):
+            extreme.update(idxs[np.argsort(values)[-exact_frames:]].tolist())
+        exact = np.array([extents(f, 1 << 30) for f in sorted(extreme)])
+        radius = float(max(coarse[:, 0].max(), exact[:, 0].max()))
+        y_min = float(min(coarse[:, 1].min(), exact[:, 1].min()))
+        y_max = float(max(coarse[:, 2].max(), exact[:, 2].max()))
+
+        height = self._body_height()
+        radius, y_min, y_max = min(radius, 2.0 * height), max(y_min, -height), min(y_max, 3.0 * height)
+        pad = 0.02 * max(radius, y_max - y_min)  # poses between the frames checked
+        return radius + pad, y_min - pad, y_max + pad
 
 
 # --------------------------------------------------------------------------- parsing

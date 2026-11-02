@@ -158,6 +158,38 @@ def test_skinning_bounds():
     assert pts[:, 1].max() == pytest.approx(2.0)
     r, lo, hi = m.animation_bounds(m.bake(0))
     assert hi > lo and r > 0
+    # Every vertex fits, so nothing gets cut off at the window edge.
+    baked = m.bake(0)
+    for f in range(baked.frame_count):
+        pts = m.pose_points(baked.world[f], {n: w[f] for n, w in baked.weights.items()})
+        assert pts[:, 1].max() <= hi and pts[:, 1].min() >= lo
+        assert np.sqrt(pts[:, 0] ** 2 + pts[:, 2] ** 2).max() <= r
+
+
+def _with_world(baked, world):
+    return gltf.BakedAnimation(baked.name, baked.duration, baked.fps, world,
+                               {n: np.repeat(w[:1], len(world), axis=0) for n, w in baked.weights.items()})
+
+
+def test_animation_bounds_find_a_brief_extreme_pose():
+    m = gltf.load_bytes(build_glb())
+    base = m.bake(0)
+    world = np.repeat(base.world[:1], 1000, axis=0)
+    calm = m.animation_bounds(_with_world(base, world))
+    # Lift everything for a handful of frames, as a hair swing peak would.
+    world[500:510, :, 1, 3] += 0.4
+    assert m.animation_bounds(_with_world(base, world))[2] > calm[2] + 0.3
+
+
+def test_animation_bounds_cap_faraway_props():
+    m = gltf.load_bytes(build_glb())
+    base = m.bake(0)
+    world = np.repeat(base.world[:1], 10, axis=0)
+    world[:, :, 0, 3] += 500.0
+    world[:, :, 1, 3] += 500.0
+    radius, _, y_max = m.animation_bounds(_with_world(base, world))
+    height = m._body_height()
+    assert radius <= 2.1 * height and y_max <= 3.1 * height
 
 
 def test_slerp_endpoints_and_shortest_path():
